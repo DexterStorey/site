@@ -2,9 +2,9 @@
 	"framework": null,
 	"redirects": [
 		{
-			"source": "/:path*",
+			"source": "/(.*)",
 			"has": [{ "type": "host", "value": "www.dexterstorey.com" }],
-			"destination": "https://dexterstorey.com/:path*",
+			"destination": "https://dexterstorey.com/$1",
 			"permanent": true
 		},
 		{ "source": "/:page(home|drafts|portfolio|catalog|storage1)", "destination": "/", "permanent": false }
