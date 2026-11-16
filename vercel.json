@@ -1,0 +1,12 @@
+{
+	"framework": null,
+	"redirects": [
+		{
+			"source": "/:path*",
+			"has": [{ "type": "host", "value": "www.dexterstorey.com" }],
+			"destination": "https://dexterstorey.com/:path*",
+			"permanent": true
+		},
+		{ "source": "/:page(home|drafts|portfolio|catalog|storage1)", "destination": "/", "permanent": false }
+	]
+}
