@@ -6,9 +6,17 @@ const OUTPUTS = [49, 49, 2, 6, 2]
 const WIDTH = 64
 const STATE = 256
 
-// The size of every tensor, in the order train.py wrote them:
-// a table per input stream, the recurrent core, then a head per output stream.
-const sizes = [...INPUTS.map(size => size * WIDTH), 3 * STATE * WIDTH, 3 * STATE * STATE, 3 * STATE, 3 * STATE, ...OUTPUTS.flatMap(size => [size * STATE, size])]
+// The size of every tensor, in the order train.py wrote them: a table per input stream,
+// the recurrent core, a head per output stream, then the table that tells dy which dx was chosen.
+const sizes = [
+	...INPUTS.map(size => size * WIDTH),
+	3 * STATE * WIDTH,
+	3 * STATE * STATE,
+	3 * STATE,
+	3 * STATE,
+	...OUTPUTS.flatMap(size => [size * STATE, size]),
+	OUTPUTS[0] * STATE
+]
 
 // One set of tensors: a scale per tensor, then every weight as a single byte.
 function unpack(buffer, offset) {
@@ -54,7 +62,8 @@ export async function load() {
 			state.fill(0)
 		},
 
-		// Reads one frame, updates the state, and returns the scores for each output stream.
+		// Reads one frame and updates the state. Returns a function that scores one output
+		// stream. The dy stream (1) also needs the dx that was chosen, so the two agree.
 		tick(frame) {
 			const x = new Float32Array(WIDTH)
 			frame.forEach((value, stream) => {
@@ -70,7 +79,11 @@ export async function load() {
 				state[i] = (1 - keep) * fresh + keep * state[i]
 			}
 			const heads = weights.slice(INPUTS.length + 4)
-			return OUTPUTS.map((size, stream) => linear(heads[stream * 2], heads[stream * 2 + 1], state, size))
+			const given = weights.at(-1)
+			return (stream, dx) => {
+				const from = stream === 1 ? state.map((value, i) => value + given[dx * STATE + i]) : state
+				return linear(heads[stream * 2], heads[stream * 2 + 1], from, OUTPUTS[stream])
+			}
 		}
 	}
 }

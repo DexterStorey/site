@@ -4,25 +4,29 @@
 # ///
 """Trains the tiny model that draws on dexterstorey.com and writes model.bin.
 
-The model drives a plotter pen on a tick. Every tick it reads one number per input stream
-(the key pressed, a click, where the click is, where the pen is, its own last move) and writes
-one number per output stream (move x, move y, pen down, size, busy).
+The model drives a pen on a tick. Every tick it reads one number per input stream (the key
+pressed, a click, where the click is, where the pen is, its own last move) and writes one
+number per output stream (move x, move y, pen down, size, busy).
 
-It learns by copying `Teacher`, a hand-written pen that draws lines, rings, waves, grids and
-other plain figures, writes what is typed and goes where it is clicked. `Page` is the world
-they both live in, and agent.js repeats its rules in the browser.
+It learns by copying `Teacher`, a pen that replays drawings made by people: squiggles, zigzags,
+coils, waves and rough shapes from Google's Quick, Draw! set (CC BY 4.0). The teacher also
+writes what is typed and goes where it is clicked. `Page` is the world they both live in, and
+agent.js repeats its rules in the browser.
 
-Training has two parts. The base copies the calm teacher. The fine-tune copies a wild one.
-model.bin holds the base and the difference, so the page can slide from calm to wild.
+Training has two parts. The base copies the calm teacher. The fine-tune copies a wild one,
+with a shaky hand. model.bin holds the base and the difference, so the page can slide between.
 
-Run: uv run train.py          trains and writes model.bin
+Run: uv run train.py          fetches the drawings once, trains, and writes model.bin
      uv run train.py teacher  only draws what the two teachers do, to teacher-*.png
 """
 
+import json
 import math
 import os
 import random
 import sys
+import urllib.parse
+import urllib.request
 from collections import deque
 from multiprocessing import Pool
 
@@ -70,6 +74,38 @@ def glyphs():
 
 
 GLYPHS = glyphs()
+
+
+SUBJECTS = "squiggle zigzag hurricane tornado ocean river lightning rain line circle triangle square hexagon octagon star sun snowflake stitches diamond"
+
+
+def fetch():
+    """Downloads the first few thousand drawings of each subject and saves them all as pen
+    moves in data/moves.npz: every move in one long list, and where each drawing starts."""
+    moves, starts = [], [0]
+    for subject in SUBJECTS.split():
+        address = f"https://storage.googleapis.com/quickdraw_dataset/full/simplified/{urllib.parse.quote(subject)}.ndjson"
+        part = urllib.request.urlopen(urllib.request.Request(address, headers={"Range": "bytes=0-3000000"})).read()
+        for line in part.decode(errors="ignore").split("\n")[:-1]:  # the last line is cut short
+            sketch = json.loads(line)
+            x, y = (round(point[0] / 5) for point in sketch["drawing"][0])
+            drawing = []
+            for xs, ys in sketch["drawing"]:
+                for i, (px, py) in enumerate(zip(xs, ys)):
+                    px, py = round(px / 5), round(py / 5)
+                    if (px, py) != (x, y):
+                        drawing += hop(px - x, py - y, int(i > 0))
+                        x, y = px, py
+            if sketch["recognized"] and 3 <= len(drawing) <= 120:
+                moves += drawing
+                starts.append(len(moves))
+        print(subject, len(starts) - 1, "drawings so far", flush=True)
+    os.makedirs("data", exist_ok=True)
+    np.savez("data/moves.npz", moves=np.array(moves, dtype=np.int8), starts=np.array(starts, dtype=np.int32))
+
+
+DRAWINGS = np.load("data/moves.npz") if os.path.exists("data/moves.npz") else None
+MOVES, STARTS = (DRAWINGS["moves"].tolist(), DRAWINGS["starts"].tolist()) if DRAWINGS else ([], [0])
 
 
 def offset(distance):
@@ -186,13 +222,9 @@ class Teacher:
         return (dx > 0 and self.at[CX] >= 15) or (dx < 0 and self.at[CX] <= 0) or (dy > 0 and self.at[CY] >= 15) or (dy < 0 and self.at[CY] <= 0)
 
     def idle(self):
-        """Picks what to draw next. Each row is an act, how often when calm, how often when wild."""
-        acts = [
-            (self.travel, 6, 4), (self.rest, 3, 0.3), (self.rule, 3, 2), (self.circle, 3, 3), (self.wave, 3, 3),
-            (self.polygon, 2.5, 2), (self.rays, 2, 3), (self.grid, 2, 1), (self.meander, 2, 3), (self.hatch, 2, 3),
-            (self.spiral, 1.5, 2), (self.stairs, 1, 1), (self.scribble, 0, 2),
-        ]  # fmt: skip
-        return self.pick([act for act, _, _ in acts], [calm + (wild - calm) * self.wild for _, calm, wild in acts])()
+        """Draws, or moves on. Near the edge of the page it always moves on."""
+        near_edge = self.at[CX] in (0, 15) or self.at[CY] in (0, 15)
+        return self.travel() if near_edge or self.chance(0.3) else self.doodle()
 
     def go(self):
         """Lifts the pen and closes in on the click, one look at a time. Then draws something there."""
@@ -200,7 +232,7 @@ class Teacher:
             dx, dy, scale = toward(self.at[TX], self.at[TY])
             yield from self.do(dx, dy, 0, scale)
         self.resize()
-        yield from self.pick([self.circle, self.rays, self.polygon, self.spiral, self.rest], [3, 3, 2, 2, 1])()
+        yield from self.doodle()
 
     def write(self):
         """Writes the key in this frame, then keeps going for as long as keys keep coming."""
@@ -225,153 +257,11 @@ class Teacher:
             while self.at[CY] > 1:
                 yield from self.do(0, -REACH, 0, busy=1)
 
-    # Every figure comes in a few fixed sizes and stops either on a count the model can see
-    # or on a coin toss, so the model can learn each one exactly instead of guessing.
-
-    def rule(self):
-        """Straight lines side by side, solid or dashed."""
-        ax, ay = self.pick([(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1)], [6, 3, 2, 2, 1, 1])
-        dashed = self.chance(0.25)
-        step = 6 if dashed else self.pick([12, 24])
-        gap, length = self.pick([2, 3, 5, 8, 13]), self.pick([4, 8, 16, 32])
-        while True:
-            for i in range(length):
-                if self.edge(ax, ay):
-                    break
-                yield from self.do(ax * step, ay * step, int(not dashed or i % 2 == 0))
-            if self.chance(0.45):
-                return
-            yield from self.do(gap * (ax == 0), gap * (ax != 0), 0)
-            ax, ay = -ax, -ay
-
-    def circle(self):
-        """Rings around one centre, whole or half."""
-        radius, grow, half = self.pick([4, 7, 12, 20, 32]), self.pick([2, 4]), self.chance(0.2)
-        angle, turn = 0, self.pick([1, -1])
-        while True:
-            steps = max(8, round(radius * 1.2)) // (2 if half else 1)
-            x, y = round(radius * math.cos(angle)), round(radius * math.sin(angle))
-            for _ in range(steps):
-                angle += turn * math.pi / steps * (1 if half else 2)
-                nx, ny = round(radius * math.cos(angle)), round(radius * math.sin(angle))
-                yield from self.do(nx - x, ny - y, 1)
-                x, y = nx, ny
-            if self.chance(0.55):
-                return
-            yield from self.do(round(grow * math.cos(angle)), round(grow * math.sin(angle)), 0)
-            radius += grow
-            turn = -turn if half else turn
-
-    def spiral(self):
-        radius, grow, angle, turn = 2, self.pick([3, 5]) / math.tau, 0, self.pick([1, -1])
-        x, y = radius, 0
-        while radius < 45 and not (radius > 6 and self.chance(1 / 40)):
-            swing = min(0.6, 6 / radius)
-            angle += turn * swing
-            radius += grow * swing
-            nx, ny = round(radius * math.cos(angle)), round(radius * math.sin(angle))
-            yield from self.do(nx - x, ny - y, 1)
-            x, y = nx, ny
-
-    def polygon(self):
-        """Triangles, squares and hexagons, nested and sometimes twisting as they grow."""
-        sides = self.pick([3, 4, 6], [2, 5, 2])
-        radius, grow, twist = self.pick([6, 12, 20]), self.pick([3, 5]), self.pick([0, 0, math.pi / 12])
-        angle = math.pi / sides
-        corner = lambda k: (round(radius * math.cos(angle + math.tau * k / sides)), round(radius * math.sin(angle + math.tau * k / sides)))
-        x, y = corner(0)
-        while True:
-            for k in range(1, sides + 1):
-                nx, ny = corner(k)
-                yield from self.line(nx - x, ny - y, 1)
-                x, y = nx, ny
-            if self.chance(0.4):
-                return
-            radius, angle = radius + grow, angle + twist
-            nx, ny = corner(0)
-            yield from self.line(nx - x, ny - y, 0)
-            x, y = nx, ny
-
-    def rays(self):
-        """Lines out from one point, all the same or long and short in turn."""
-        count, length, uneven = self.pick([8, 12, 16, 24]), self.pick([6, 12, 24, 40]), self.chance(0.3)
-        for k in range(count):
-            reach = length / 2 if uneven and k % 2 else length
-            dx, dy = round(reach * math.cos(math.tau * k / count)), round(reach * math.sin(math.tau * k / count))
-            yield from self.line(dx, dy, 1)
-            yield from self.line(-dx, -dy, 0)
-
-    def wave(self):
-        """Rows of the same wave, each row in step with the last or a quarter turn behind."""
-        tall, period = self.pick([2, 4, 8]), self.pick([8, 12, 16])
-        shift, step, gap = self.pick([0, period // 4]), self.pick([3, 4, 6]), self.pick([4, 6, 8])
-        length = period * self.pick([1, 2, 3, 4])
-        height = lambda i, row: round(tall * math.sin(math.tau * (i + shift * row) / period))
-        i, way, row = 0, 1, 0
-        while True:
-            for _ in range(length):
-                if self.edge(way, 0):
-                    break
-                yield from self.do(way * step, height(i + way, row) - height(i, row), 1)
-                i += way
-            if self.chance(0.2):
-                return
-            yield from self.line(0, gap + height(i, row + 1) - height(i, row), 0)
-            way, row = -way, row + 1
-
-    def grid(self):
-        cell, columns, rows = self.pick([4, 6, 8, 12]), self.pick([2, 3, 4, 6]), self.pick([2, 3, 4, 6])
-        way, up = 1, -1
-        for row in range(rows + 1):
-            if row:
-                yield from self.line(0, cell, 0)
-            yield from self.line(way * columns * cell, 0, 1)
-            way = -way
-        for column in range(columns + 1):
-            if column:
-                yield from self.line(way * cell, 0, 0)
-            yield from self.line(0, up * rows * cell, 1)
-            up = -up
-
-    def meander(self):
-        """One long line that wanders and never turns sharply."""
-        heading, step, curl = self.random.random() * math.tau, self.random.randint(3, 8), self.pick([0.05, 0.1, 0.2])
-        bend = 0
-        while not self.chance(1 / 70):
-            bend = max(-0.5, min(0.5, bend + self.random.gauss(0, curl)))
-            heading += bend
-            dx, dy = round(step * math.cos(heading)), round(step * math.sin(heading))
-            if self.edge(dx, dy):
-                heading += math.pi
-            yield from self.do(dx, dy, 1)
-
-    def stairs(self):
-        across, down = self.pick([3, 6, 10]) * self.pick([1, -1]), self.pick([3, 6, 10]) * self.pick([1, -1])
-        while not self.chance(1 / 12) and not self.edge(across, down):
-            yield from self.do(across, 0, 1)
-            yield from self.do(0, down, 1)
-
-    def hatch(self):
-        """Short strokes packed side by side, to shade a patch."""
-        ax, ay = self.pick([(6, 6), (6, -6), (0, 8), (8, 0), (8, 3)])
-        gap, length = self.pick([1, 2, 3]), self.pick([1, 2, 3, 4])
-        while True:
-            for _ in range(length):
-                yield from self.do(ax, ay, 1)
-            if self.chance(0.07):
-                return
-            yield from self.do(gap * (ay != 0), gap * (ay == 0), 0)
-            ax, ay = -ax, -ay
-
-    def scribble(self):
-        """A loose tangle: the pen keeps moving and its heading jumps about. Only the wild teacher does this."""
-        heading, step = self.random.random() * math.tau, self.random.randint(3, 9)
-        while not self.chance(1 / 50):
-            heading += self.random.gauss(0, 0.6)
-            dx, dy = round(step * math.cos(heading)), round(step * math.sin(heading))
-            if self.edge(dx, dy):
-                heading += math.pi
-            yield from self.do(dx, dy, 1)
+    def doodle(self):
+        """Replays one drawing a person made, at the size the pen is set to."""
+        drawing = self.random.randrange(len(STARTS) - 1)
+        for dx, dy, pen in MOVES[STARTS[drawing] : STARTS[drawing + 1]]:
+            yield from self.do(dx, dy, pen)
 
     def travel(self):
         """Crosses the page with the pen up, more often toward the middle than away."""
@@ -385,7 +275,8 @@ class Teacher:
         self.resize()
 
     def rest(self):
-        while not self.chance(1 / 120 + self.wild):
+        """Waits a moment after typing, in case another key is coming."""
+        while not self.chance(1 / 150 + self.wild):
             yield from self.do()
 
 
@@ -432,6 +323,10 @@ def draw(pages, path):
     sheet.save(path)
 
 
+if __name__ == "__main__" and not DRAWINGS:
+    fetch()
+    sys.exit("Fetched the drawings. Run it again to use them.")
+
 if __name__ == "__main__" and sys.argv[1:] == ["teacher"]:
     for wild, ticks in ((0, 6000), (0, 20000), (1, 6000), (1, 20000)):
         draw([episode((seed, wild, ticks, size, True))[2] for seed, size in enumerate([(1280, 800), (390, 800)])], f"teacher-{wild}-{ticks}.png")
@@ -447,10 +342,16 @@ class Model(nn.Module):
         self.read = nn.ModuleList(nn.Embedding(size, 64) for size in INPUTS)
         self.core = nn.GRU(64, 256, batch_first=True)
         self.write = nn.ModuleList(nn.Linear(256, size) for size in OUTPUTS)
+        self.given = nn.Embedding(OUTPUTS[0], 256)
 
     def forward(self, frames, state=None):
-        x, state = self.core(sum(table(frames[..., i]) for i, table in enumerate(self.read)), state)
-        return [head(x) for head in self.write], state
+        """The state after reading these frames."""
+        return self.core(sum(table(frames[..., i]) for i, table in enumerate(self.read)), state)
+
+    def scores(self, x, dx):
+        """Scores for every output stream. The dy stream also sees the dx that was chosen, so
+        the two halves of a move agree with each other."""
+        return [head(x + self.given(dx) if i == 1 else x) for i, head in enumerate(self.write)]
 
 
 def lessons(wild, count, seed):
@@ -471,8 +372,9 @@ def study(model, wild, rounds, rate):
             rows, state = slice(batch * 48, batch * 48 + 48), None
             for start in range(0, 2048, 256):
                 x, y = frames[rows, start : start + 256], actions[rows, start : start + 256]
-                guesses, state = model(x, state)
+                hidden, state = model(x, state)
                 state = state.detach()
+                guesses = model.scores(hidden, y[..., 0])
                 loss = sum(F.cross_entropy(guess.flatten(0, 1), y[..., i].flatten()) for i, guess in enumerate(guesses))
                 optimizer.zero_grad()
                 loss.backward()
@@ -487,13 +389,15 @@ def study(model, wild, rounds, rate):
 def play(model, ticks, heat, size, seed):
     """Lets the model draw on its own page. A scripted visitor types and clicks, to see it react."""
     torch.manual_seed(seed)
-    page, state, lines = Page(*size, 16, 24), None, []
-    page.keys.extend(KEYS.index(key) + 1 for key in "Dexter Storey")
+    page, state, lines = Page(*size, size[0] // 2, size[1] // 2), None, []
+    choose = lambda scores: torch.multinomial(F.softmax(scores[0, 0] / heat, 0), 1)
     for tick in range(ticks):
         if tick == ticks // 4:
             page.keys.extend(KEYS.index(key) + 1 for key in "hello")
-        guesses, state = model(torch.tensor([[page.frame((size[0] // 2, size[1] // 2) if tick == ticks // 2 else None)]]), state)
-        line = page.move([torch.multinomial(F.softmax(guess[0, 0] / heat, 0), 1).item() - (REACH if i < 2 else 0) for i, guess in enumerate(guesses)])
+        hidden, state = model(torch.tensor([[page.frame((size[0] // 4, size[1] // 4) if tick == ticks // 2 else None)]]), state)
+        dx = choose(model.write[0](hidden))
+        action = [choose(scores).item() for scores in model.scores(hidden, dx.view(1, 1))]
+        line = page.move((dx.item() - REACH, action[1] - REACH, *action[2:]))
         if line:
             lines.append(line)
     return (*size, lines)
@@ -538,4 +442,4 @@ if __name__ == "__main__":
     for slide in (0, 0.1, 0.2, 0.3, 0.5, 1):
         mixed = Model()
         mixed.load_state_dict({name: value + slide * (wild.state_dict()[name] - value) for name, value in calm.state_dict().items()})
-        draw([play(mixed, 6000, 0.7, size, 0) for size in [(1280, 800), (390, 800)]], f"model-{slide}.png")
+        draw([play(mixed, 6000, 0.9, size, 0) for size in [(1280, 800), (390, 800)]], f"model-{slide}.png")
