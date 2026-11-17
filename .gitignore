@@ -5,3 +5,4 @@ __pycache__
 *.pt
 *.png
 data
+node_modules
